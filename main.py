@@ -4,18 +4,22 @@ from sqlalchemy import create_engine, Column, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta
-import os, secrets
+import os
+import secrets
 from jose import jwt
 
+# --- 設定 ---
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_urlsafe(32))
 ALGORITHM = "HS256"
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
     elif DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
+# --- DB設定 ---
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -24,18 +28,21 @@ class License(Base):
     __tablename__ = "licenses"
     key = Column(String, primary_key=True, index=True)
     hwid = Column(String, nullable=True)
-    owner_name = Column(String, nullable=True)  # ★追加
+    owner_name = Column(String, nullable=True)
     activated_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=True)  # ★追加 (Noneなら無期限)
+    expires_at = Column(DateTime, nullable=True) # Noneなら無期限
     is_active = Column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
+
 app = FastAPI()
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class ActivateRequest(BaseModel):
     license_key: str
@@ -45,11 +52,20 @@ class VerifyRequest(BaseModel):
     license_key: str
     hwid: str
 
+class GenerateRequest(BaseModel):
+    owner_name: str
+    expires_at: str = ""
+    preset: str = "custom"
+
 def create_token(data: dict):
     expire = datetime.utcnow() + timedelta(days=30)
     to_encode = data.copy()
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# ============================================================
+# クライアント用エンドポイント
+# ============================================================
 
 @app.post("/api/activate")
 def activate(req: ActivateRequest, db: Session = Depends(get_db)):
@@ -57,7 +73,6 @@ def activate(req: ActivateRequest, db: Session = Depends(get_db)):
     if not lic or not lic.is_active:
         raise HTTPException(status_code=404, detail="無効なライセンスキーです")
     
-    # 有効期限チェック
     if lic.expires_at and lic.expires_at < datetime.utcnow():
         raise HTTPException(status_code=403, detail="このライセンスは有効期限が切れています")
 
@@ -78,7 +93,6 @@ def verify(req: VerifyRequest, db: Session = Depends(get_db)):
     if not lic or not lic.is_active:
         raise HTTPException(status_code=404, detail="無効なライセンスです")
     
-    # 有効期限チェック
     if lic.expires_at and lic.expires_at < datetime.utcnow():
         raise HTTPException(status_code=403, detail="このライセンスは有効期限が切れています")
     
@@ -87,22 +101,21 @@ def verify(req: VerifyRequest, db: Session = Depends(get_db)):
     
     return {"status": "valid", "token": create_token({"key": lic.key, "hwid": lic.hwid})}
 
-# ★ 管理用API（キー発行 & 使用者一覧取得）
-class GenerateRequest(BaseModel):
-    owner_name: str
-    expires_at: str  # ISO形式 (例: "2026-12-31T23:59:59")
-    preset: str = "custom"  # "1day", "1month", "3month", "lifetime", "custom"
+
+# ============================================================
+# 管理用エンドポイント
+# ============================================================
+
+ADMIN_SECRET = "genesis-admin-2026"
 
 @app.post("/api/admin/generate")
 def admin_generate(req: GenerateRequest, secret: str, db: Session = Depends(get_db)):
-    if secret != "genesis-admin-2026":
+    if secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
-    # キー生成 (例: XXXX-XXXX-XXXX-XXXX)
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     new_key = "-".join(''.join(secrets.choice(chars) for _ in range(4)) for _ in range(4))
     
-    # 有効期限の計算
     now = datetime.utcnow()
     if req.preset == "1day":
         exp = now + timedelta(days=1)
@@ -122,16 +135,58 @@ def admin_generate(req: GenerateRequest, secret: str, db: Session = Depends(get_
     db.add(lic)
     db.commit()
     db.refresh(lic)
-    return {"license_key": lic.key, "owner_name": lic.owner_name, "expires_at": str(lic.expires_at)}
+    
+    return {
+        "license_key": lic.key, 
+        "owner_name": lic.owner_name, 
+        "expires_at": str(lic.expires_at) if lic.expires_at else "無期限"
+    }
 
 @app.get("/api/admin/list")
 def admin_list(secret: str, db: Session = Depends(get_db)):
-    if secret != "genesis-admin-2026":
+    if secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Unauthorized")
+    
     licenses = db.query(License).all()
     return [{
-        "key": l.key, "owner_name": l.owner_name, "hwid": l.hwid,
+        "key": l.key, 
+        "owner_name": l.owner_name, 
+        "hwid": l.hwid,
         "activated_at": str(l.activated_at) if l.activated_at else None,
         "expires_at": str(l.expires_at) if l.expires_at else "無期限",
         "is_active": l.is_active
     } for l in licenses]
+
+@app.post("/api/admin/toggle_status")
+def admin_toggle_status(key: str, secret: str, db: Session = Depends(get_db)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    lic = db.query(License).filter(License.key == key).first()
+    if lic:
+        lic.is_active = not lic.is_active
+        db.commit()
+        return {"status": "success", "is_active": lic.is_active}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+@app.post("/api/admin/reset_hwid")
+def admin_reset_hwid(key: str, secret: str, db: Session = Depends(get_db)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    lic = db.query(License).filter(License.key == key).first()
+    if lic:
+        lic.hwid = None
+        lic.activated_at = None
+        db.commit()
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="Key not found")
+
+@app.delete("/api/admin/delete")
+def admin_delete_key(key: str, secret: str, db: Session = Depends(get_db)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    lic = db.query(License).filter(License.key == key).first()
+    if lic:
+        db.delete(lic)
+        db.commit()
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="Key not found")
